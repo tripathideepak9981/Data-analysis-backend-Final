@@ -1,0 +1,17 @@
+fastapi==0.95.1
+uvicorn[standard]==0.22.0
+python-multipart==0.0.5
+pandas==2.2.0
+sqlalchemy==2.0.20
+mysql-connector-python==8.0.33
+python-dotenv==0.21.1
+langchain_google_genai==0.1.0
+langchain_core==0.0.5
+spacy==3.6.0
+duckdb==0.8.1
+passlib[bcrypt]==1.7.4
+python-jose==3.3.0
+vertica-sqlalchemy==0.6.3
+python -m spacy download en_core_web_sm
+ 
+ 
