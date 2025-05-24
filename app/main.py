@@ -2,6 +2,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import auth,upload, db, query, join, modify,chart
+from app.routes import validate_sql
  
 app = FastAPI(title="AI Data Analysis Chatbot API")
  
@@ -22,6 +23,7 @@ app.include_router(query.router, prefix="/api")
 app.include_router(join.router, prefix="/api")
 app.include_router(modify.router, prefix="/api")
 app.include_router(chart.router, prefix="/chart", tags=["Chart"])
+app.include_router(validate_sql.router, prefix="/api", tags=["SQL Validation"])
  
  
  

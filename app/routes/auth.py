@@ -10,6 +10,15 @@ from sqlalchemy import create_engine, text
 from app.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, MYSQL_USER, MYSQL_PASSWORD, MYSQL_HOST, DATABASE_URI
 from app.database import SessionLocal
 from app.models import User
+from app.utils.db_helpers import connect_personal_db, load_tables_from_personal_db, list_tables
+from app.config import GOOGLE_API_KEY, MODEL_NAME
+from app.utils.llm_helpers import GoogleGenerativeAI
+ 
+llm = GoogleGenerativeAI(model=MODEL_NAME, api_key=GOOGLE_API_KEY)
+ 
+ 
+ 
+ 
  
 router = APIRouter()
 logger = logging.getLogger("auth")
@@ -27,6 +36,7 @@ class UserCreate(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str
+    tables: list[str] = []
  
 def get_db():
     db = SessionLocal()
@@ -71,51 +81,103 @@ def create_dynamic_database_for_user(user: User) -> str:
  
 @router.post("/signup", response_model=Token)
 def signup(user: UserCreate, db: Session = Depends(get_db)):
+    # Check if user already exists
     if get_user_by_email(db, user.email):
         raise HTTPException(status_code=400, detail="Email already registered")
     if get_user_by_username(db, user.username):
         raise HTTPException(status_code=400, detail="Username already registered")
    
+    # Hash password
     hashed_password = get_password_hash(user.password)
-    # Note: dynamic_db is set to empty string here.
-    new_user = User(email=user.email, username=user.username, hashed_password=hashed_password, dynamic_db="")
+ 
+    # ✅ Create dynamic database for user at signup time
+    db_name = create_dynamic_database_for_user(user)
+ 
+    # ✅ Save the dynamic_db name immediately in user record
+    new_user = User(
+        email=user.email,
+        username=user.username,
+        hashed_password=hashed_password,
+        dynamic_db=db_name  # ✅ Stored in DB immediately
+    )
+ 
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
-   
+ 
+    # Generate JWT token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": new_user.username, "user_id": new_user.id},
         expires_delta=access_token_expires,
     )
-    logger.info(f"User '{new_user.username}' signed up successfully. No dynamic database created yet.")
+ 
+    logger.info(f"User '{new_user.username}' signed up and dynamic DB '{db_name}' created.")
     return {"access_token": access_token, "token_type": "bearer"}
  
+ 
+ 
 @router.post("/login", response_model=Token)
-
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-
-    # Use the 'username' field from the form as the email address.
-
+    from app.utils.llm_helpers import GoogleGenerativeAI, generate_initial_suggestions_from_state
+    from app.config import GOOGLE_API_KEY, MODEL_NAME
+    from app.state import state
+ 
     user = get_user_by_email(db, form_data.username)
-
     if not user or not verify_password(form_data.password, user.hashed_password):
-
         raise HTTPException(status_code=400, detail="Incorrect email or password")
-
+ 
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-
     access_token = create_access_token(
-
         data={"sub": user.username, "user_id": user.id},
-
         expires_delta=access_token_expires,
-
     )
-
-    logger.info(f"User '{user.username}' logged in successfully using email.")
-
-    return {"access_token": access_token, "token_type": "bearer"}
+ 
+    logger.info(f"User '{user.username}' logged in.")
+ 
+    loaded_table_names = []
+ 
+    if user.dynamic_db:
+        from app.utils.db_helpers import connect_personal_db, load_tables_from_personal_db, list_tables
+ 
+        engine = connect_personal_db(
+            db_type="mysql",
+            host=MYSQL_HOST,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=user.dynamic_db
+        )
+ 
+        if engine:
+            table_names = list_tables(engine)
+            loaded, original = load_tables_from_personal_db(engine, table_names)
+ 
+            state["personal_engine"] = engine
+            state["table_names"] = loaded
+            state["original_table_names"] = original
+ 
+            loaded_table_names = [name for name, _ in loaded]
+            logger.info(f"Preloaded tables for user '{user.username}': {loaded_table_names}")
+ 
+            # ✅ NEW: Generate initial suggestions now
+            try:
+                llm = GoogleGenerativeAI(model=MODEL_NAME, api_key=GOOGLE_API_KEY)
+                suggestions = generate_initial_suggestions_from_state(llm, state)
+                state["initial_suggestions"] = suggestions
+                logger.info(f"Generated initial suggestions for user '{user.username}': {suggestions}")
+            except Exception as e:
+                logger.warning(f"Suggestion generation failed: {e}")
+                state["initial_suggestions"] = []
+ 
+        else:
+            logger.warning(f"Failed to connect to DB for user '{user.username}' on login.")
+ 
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "tables": loaded_table_names
+    }
+ 
  
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     credentials_exception = HTTPException(
@@ -144,5 +206,4 @@ def logout(response: Response, current_user: User = Depends(get_current_user)):
     """
     response.delete_cookie("access_token")
     return {"detail": "Successfully logged out"}
- 
  

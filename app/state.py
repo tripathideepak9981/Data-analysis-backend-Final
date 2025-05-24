@@ -1,5 +1,6 @@
 # app/state.py
 import threading
+import duckdb
  
 class GlobalState(dict):
     """
@@ -30,5 +31,13 @@ state = GlobalState({
     "mysql_connection": None,    # MySQL connector connection if used
     "chat_history": []           # (Optional) Chat history if needed
 })
+ 
+# Add persistent DuckDB connection to state if not already set.
+if "duckdb_conn" not in state:
+    state["duckdb_conn"] = duckdb.connect(database=':memory:')
+ 
+def get_duckdb_connection():
+    """Return the persistent DuckDB connection."""
+    return state["duckdb_conn"]
  
  

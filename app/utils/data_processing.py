@@ -1,7 +1,8 @@
 # app/utils/data_processing.py
-import pandas as pd
 import re
 import math
+import pandas as pd
+
 
 def load_data(file) -> pd.DataFrame:
     try:
@@ -33,7 +34,7 @@ def clean_nan(obj):
     else:
         return obj
 
-def get_data_preview(df: pd.DataFrame, max_rows=10, max_columns=10) -> list:
+def get_data_preview(df: pd.DataFrame, max_rows=15000, max_columns=200) -> list:
     if df.shape[1] > max_columns:
         preview_df = df.iloc[:max_rows, :max_columns]
     else:
@@ -77,3 +78,36 @@ def generate_detailed_overview_in_memory(table_names: list) -> str:
         )
         overview_text_parts.append(block)
     return "\n".join(overview_text_parts)
+
+ 
+def summarize_schema_for_llm(table_names: list[tuple[str, pd.DataFrame]]) -> str:
+    """
+    Creates a concise schema summary string from all uploaded tables for LLM prompting.
+    """
+    parts = []
+    for tname, df in table_names:
+        row_count = len(df)
+        num_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
+ 
+        numeric_stats = []
+        for col in num_cols:
+            col_data = df[col].dropna()
+            if not col_data.empty:
+                stats = f"{col} (min: {col_data.min():.2f}, max: {col_data.max():.2f}, mean: {col_data.mean():.2f})"
+                numeric_stats.append(stats)
+ 
+        cat_stats = []
+        for col in cat_cols:
+            top_vals = df[col].dropna().value_counts().head(3).index.tolist()
+            cat_stats.append(f"{col} (e.g. {', '.join(map(str, top_vals))})")
+ 
+        part = f"""Table: {tname}
+- Rows: {row_count}
+- Numeric: {', '.join(numeric_stats) or 'None'}
+- Categorical: {', '.join(cat_stats) or 'None'}"""
+        parts.append(part)
+    return "\n\n".join(parts)
+ 
+ 
+ 

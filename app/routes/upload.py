@@ -3,14 +3,15 @@ import os
 import time
 import logging
 from io import BytesIO
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Depends
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Depends, Query
 from fastapi.encoders import jsonable_encoder
 from typing import List, Dict
 import pandas as pd
 import sqlalchemy
 from sqlalchemy import text
 from app.database import get_db  # Import get_db dependency
- 
+from sqlalchemy.orm import Session
+from app.models import User
  
 from app.utils.data_processing import load_data, generate_table_name, get_data_preview
 from app.utils.cleaning import validate_data, clean_data, rename_case_conflict_columns
@@ -140,6 +141,12 @@ async def process_file(file: UploadFile) -> List[dict]:
         raise HTTPException(status_code=400, detail=f"File {file.filename} is too large (max 10MB).")
     file.file.seek(0)
    
+    # Duplicate file check: reject if a file with the same base name is already uploaded.
+    base_table_name = generate_table_name(file.filename)
+    existing_names = {name for name, _ in state["table_names"]}
+    if base_table_name in existing_names:
+        raise HTTPException(status_code=400, detail=f"Duplicate file '{file.filename}' not allowed.")
+   
     results = []
    
     # Process CSV files.
@@ -159,7 +166,7 @@ async def process_file(file: UploadFile) -> List[dict]:
             logger.error(f"Error generating cleaning summary for {file.filename}: {e}")
             cleaning_summary = f"Failed to generate cleaning summary: {e}"
  
-        tbl_name = generate_table_name(file.filename)
+        tbl_name = base_table_name  # Use the base name directly.
         duplicate_issue = has_duplicate_columns(df)
         # Store the raw data in state so that it can be saved later upon user confirmation.
         state["table_names"].append((tbl_name, df))
@@ -214,7 +221,7 @@ async def process_file(file: UploadFile) -> List[dict]:
                 df_sheet["sheet_name"] = sheet_name  # Preserve sheet identity.
                 combined_list.append(df_sheet)
             combined_df = pd.concat(combined_list, ignore_index=True)
-            tbl_name = generate_table_name(file.filename) + "_combined"
+            tbl_name = base_table_name + "_combined"
             try:
                 errors = validate_data(combined_df, file.filename + " (combined)")
                 cleaning_summary = generate_data_issue_summary(errors, file.filename + " (combined)", llm)
@@ -254,7 +261,7 @@ async def process_file(file: UploadFile) -> List[dict]:
                     logger.error(f"Error generating cleaning summary for sheet {sheet_name} in {file.filename}: {e}")
                     cleaning_summary = f"Failed to generate cleaning summary: {e}"
                
-                tbl_name = generate_table_name(file.filename) + "_" + sheet_name.lower().replace(" ", "_")
+                tbl_name = base_table_name + "_" + sheet_name.lower().replace(" ", "_")
                 duplicate_issue = has_duplicate_columns(df_sheet)
                 state["table_names"].append((tbl_name, df_sheet))
                 state["original_table_names"].append((tbl_name, df_sheet.copy()))
@@ -285,9 +292,8 @@ async def upload_files(files: List[UploadFile] = File(...), background_tasks: Ba
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded.")
     uploaded_info = []
-    # Clear previous state.
-    state["table_names"].clear()
-    state["original_table_names"].clear()
+    # Removed the clearing of state["table_names"] and state["original_table_names"]
+    # so that previously uploaded files remain available for query.
     state["personal_engine"] = None
     state["mysql_connection"] = None
     state["chat_history"].clear()
@@ -310,51 +316,8 @@ from fastapi import Query
 async def clean_file(
     table_name: str = Query(...),
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)  # Use get_db instead of SessionLocal directly
+    db: Session = Depends(get_db)
 ):
-    ...
-    # If the user hasn't confirmed saving a file before, dynamic_db will be empty.
-    if not current_user.dynamic_db:
-        dynamic_db_name = create_dynamic_database_for_user(current_user)
-        current_user.dynamic_db = dynamic_db_name
-        db.commit()  # Update the user record in the central DB.
- 
- 
-    user_engine = sqlalchemy.create_engine(
-        f"mysql+mysqlconnector://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}/{current_user.dynamic_db}",
-        pool_size=10,
-        max_overflow=20,
-        pool_recycle=1800
-    )
-    # ... proceed as before to clean data and save table into user_engine ...
-    # (Your existing code for saving the cleaned data remains unchanged)
-    for idx, (name, df) in enumerate(state["original_table_names"]):
-        if name == table_name:
-            cleaned_df = clean_data(df.copy())
-            cleaned_df = rename_case_conflict_columns(cleaned_df)
-            state["table_names"][idx] = (table_name, cleaned_df)
-            try:
-                cleaned_df.to_sql(table_name, user_engine, index=False, if_exists="replace")
-            except Exception as e:
-                logger.error(f"Error saving cleaned table {table_name}: {e}")
-                raise HTTPException(status_code=500, detail=f"Error saving cleaned table {table_name}: {e}")
-            preview = get_data_preview(cleaned_df)
-            return {
-                "status": "cleaned",
-                "table_name": table_name,
-                "preview": preview
-            }
-    raise HTTPException(status_code=404, detail="Table not found")
- 
- 
-# Similarly update the cancel_clean endpoint:
-@router.post("/cancel_clean")
-async def cancel_clean(
-    table_name: str = Query(...),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)  # Use get_db instead of SessionLocal
-):
- 
     if not current_user.dynamic_db:
         dynamic_db_name = create_dynamic_database_for_user(current_user)
         current_user.dynamic_db = dynamic_db_name
@@ -366,10 +329,62 @@ async def cancel_clean(
         max_overflow=20,
         pool_recycle=1800
     )
+ 
+    for idx, (name, df) in enumerate(state["original_table_names"]):
+        if name == table_name:
+            cleaned_df = clean_data(df.copy())
+            cleaned_df = rename_case_conflict_columns(cleaned_df)
+            state["table_names"][idx] = (table_name, cleaned_df)
+            try:
+                cleaned_df.to_sql(table_name, user_engine, index=False, if_exists="replace")
+            except Exception as e:
+                logger.error(f"Error saving cleaned table {table_name}: {e}")
+                raise HTTPException(status_code=500, detail=f"Error saving cleaned table {table_name}: {e}")
+ 
+            # ✅ Generate suggested questions after saving
+            try:
+                from app.utils.llm_helpers import generate_initial_suggestions_from_state, llm
+                suggestions = generate_initial_suggestions_from_state(llm, state)
+                state["initial_suggestions"] = suggestions
+            except Exception as e:
+                logger.warning(f"Suggestion generation failed: {e}")
+                state["initial_suggestions"] = ["Unable to generate suggestions."]
+ 
+            preview = get_data_preview(cleaned_df)
+            return {
+                "status": "cleaned",
+                "table_name": table_name,
+                "preview": preview
+            }
+ 
+    raise HTTPException(status_code=404, detail="Table not found")
+ 
+ 
+ 
+# Similarly update the cancel_clean endpoint:
+@router.post("/cancel_clean")
+async def cancel_clean(
+    table_name: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.dynamic_db:
+        dynamic_db_name = create_dynamic_database_for_user(current_user)
+        current_user.dynamic_db = dynamic_db_name
+        db.commit()
+ 
+    user_engine = sqlalchemy.create_engine(
+        f"mysql+mysqlconnector://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}/{current_user.dynamic_db}",
+        pool_size=10,
+        max_overflow=20,
+        pool_recycle=1800
+    )
+ 
     for idx, (name, df) in enumerate(state["original_table_names"]):
         if name == table_name:
             if has_duplicate_columns(df):
                 df = rename_case_conflict_columns(df)
+ 
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -380,18 +395,30 @@ async def cancel_clean(
                     if attempt == max_retries - 1:
                         raise HTTPException(status_code=500, detail=f"Error saving raw table {table_name}: {e}")
                     time.sleep(1)
+ 
             try:
                 preview = get_data_preview(df)
                 preview = jsonable_encoder(preview)
             except Exception as e:
                 logger.error(f"Error generating preview for raw table {table_name}: {e}")
                 preview = {}
+ 
             logger.info(f"Raw data for table {table_name} saved successfully (cancel cleaning).")
+ 
+            # ✅ Generate suggested questions after saving
+            try:
+                from app.utils.llm_helpers import generate_initial_suggestions_from_state, llm
+                suggestions = generate_initial_suggestions_from_state(llm, state)
+                state["initial_suggestions"] = suggestions
+            except Exception as e:
+                logger.warning(f"Suggestion generation failed: {e}")
+                state["initial_suggestions"] = ["Unable to generate suggestions."]
+ 
             return {
                 "status": "saved raw",
                 "table_name": table_name,
                 "preview": preview
             }
-    raise HTTPException(status_code=404, detail="Table not found")
  
+    raise HTTPException(status_code=404, detail="Table not found")
  
